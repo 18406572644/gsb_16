@@ -4,6 +4,7 @@ import LoginGate from '@/components/LoginGate.vue'
 import TopBar from '@/components/TopBar.vue'
 import EditorView from '@/components/EditorView.vue'
 import AnnotationPanel from '@/components/AnnotationPanel.vue'
+import TransferCenter from '@/components/transfer/TransferCenter.vue'
 
 const session = useSessionStore()
 </script>
@@ -32,5 +33,6 @@ const session = useSessionStore()
       </div>
       <AnnotationPanel />
     </div>
+    <TransferCenter />
   </div>
 </template>

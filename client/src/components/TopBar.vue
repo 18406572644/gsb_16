@@ -3,12 +3,14 @@ import { computed } from 'vue'
 import { ElMessageBox } from 'element-plus'
 import { useSessionStore } from '@/stores/session'
 import { useDocStore } from '@/stores/doc'
+import { useTransferStore } from '@/stores/transfer'
 import { collab } from '@/collab/collab'
 import { ROLE_LABEL } from '../../../shared/protocol'
 import UserAvatar from '@/components/UserAvatar.vue'
 
 const session = useSessionStore()
 const doc = useDocStore()
+const transfer = useTransferStore()
 
 const connTag = computed(() => {
   switch (session.status) {
@@ -86,6 +88,9 @@ async function quit() {
       @click="toggleOffline"
     >
       {{ session.status === 'offline' ? '重新连接' : '模拟断线' }}
+    </el-button>
+    <el-button size="small" type="primary" plain @click="transfer.open('import')">
+      导入 / 导出
     </el-button>
     <el-button size="small" plain @click="quit">退出</el-button>
   </div>

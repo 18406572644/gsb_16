@@ -5,6 +5,10 @@ import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import { WebSocketServer, WebSocket } from 'ws'
 import { DocSession, type ClientState } from './docSession'
+import { TaskManager } from './tasks/taskManager'
+import { AuditLog } from './tasks/audit'
+import { runExportJob, runImportJob } from './tasks/jobs'
+import { createTransferHandler } from './http/routes'
 import type { ClientMsg, ServerMsg } from '../../shared/protocol'
 
 const PORT = Number(process.env.PORT || 8080)
@@ -70,7 +74,31 @@ function getSession(docId: string): DocSession {
   return s
 }
 
-/* ---------------- HTTP：健康检查 + 生产模式静态托管 ---------------- */
+/* ---------------- 异步转换中心：任务调度 + 审计 + REST ---------------- */
+
+const TRANSFER_DIR = join(DATA_DIR, '_transfer')
+const auditLog = new AuditLog(join(TRANSFER_DIR, 'audit'))
+
+// jobs 执行体需要反向写产物到 TaskManager，用惰性引用装配打破构造期循环
+let taskManager: TaskManager
+taskManager = new TaskManager(
+  join(TRANSFER_DIR, 'tasks'),
+  {
+    runImport: runImportJob({ getSession, tasks: () => taskManager }),
+    runExport: runExportJob({ getSession, tasks: () => taskManager }),
+    onAudit: (entry) => auditLog.append(entry),
+  },
+  2,
+)
+taskManager.start()
+
+const transferHandler = createTransferHandler({
+  getSession,
+  tasks: taskManager,
+  audit: auditLog,
+})
+
+/* ---------------- HTTP：健康检查 + REST API + 生产模式静态托管 ---------------- */
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -87,6 +115,17 @@ const server = createServer((req: IncomingMessage, res: ServerResponse) => {
   if (url.pathname === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' })
     res.end(JSON.stringify({ ok: true, docs: sessions.size }))
+    return
+  }
+  // 转换中心 REST API（异步处理；返回 false 表示非 /api 路径，继续走静态托管）
+  if (url.pathname.startsWith('/api/')) {
+    transferHandler(req, res).catch((e) => {
+      console.error('[api] 未捕获异常:', e)
+      if (!res.headersSent) {
+        res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' })
+        res.end(JSON.stringify({ error: { code: 'INTERNAL', message: '服务器内部错误' } }))
+      }
+    })
     return
   }
   // 生产模式：托管 client/dist
@@ -324,6 +363,7 @@ export function shutdown() {
   for (const ws of alive.values()) ws.terminate()
   alive.clear()
   for (const t of persistTimers.values()) clearTimeout(t)
+  taskManager.shutdown()
   wss.close()
   server.close()
 }
