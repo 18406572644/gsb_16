@@ -3,12 +3,14 @@ import { computed } from 'vue'
 import { ElMessageBox } from 'element-plus'
 import { useSessionStore } from '@/stores/session'
 import { useDocStore } from '@/stores/doc'
+import { useConvertStore } from '@/stores/convert'
 import { collab } from '@/collab/collab'
 import { ROLE_LABEL } from '../../../shared/protocol'
 import UserAvatar from '@/components/UserAvatar.vue'
 
 const session = useSessionStore()
 const doc = useDocStore()
+const convert = useConvertStore()
 
 const connTag = computed(() => {
   switch (session.status) {
@@ -87,6 +89,13 @@ async function quit() {
     >
       {{ session.status === 'offline' ? '重新连接' : '模拟断线' }}
     </el-button>
+    <el-button size="small" type="primary" plain :disabled="!session.canEdit" @click="convert.openImport()">
+      导入
+    </el-button>
+    <el-button size="small" plain @click="convert.openExport()">导出</el-button>
+    <el-badge :value="convert.activeTaskCount" :hidden="convert.activeTaskCount === 0" class="task-badge">
+      <el-button size="small" plain @click="convert.openTaskCenter()">任务中心</el-button>
+    </el-badge>
     <el-button size="small" plain @click="quit">退出</el-button>
   </div>
 </template>

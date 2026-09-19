@@ -5,6 +5,10 @@ import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import { WebSocketServer, WebSocket } from 'ws'
 import { DocSession, type ClientState } from './docSession'
+import { createConvertHandler } from './convert/http'
+import { ConvertService } from './convert/convertService'
+import { TaskStore } from './convert/taskStore'
+import { AuditLog } from './convert/audit'
 import type { ClientMsg, ServerMsg } from '../../shared/protocol'
 
 const PORT = Number(process.env.PORT || 8080)
@@ -70,6 +74,15 @@ function getSession(docId: string): DocSession {
   return s
 }
 
+/* ---------------- 文档导入导出 / 异步转换中心 ---------------- */
+
+const CONVERT_DIR = join(DATA_DIR, 'convert')
+if (!existsSync(CONVERT_DIR)) mkdirSync(CONVERT_DIR, { recursive: true })
+const taskStore = new TaskStore(CONVERT_DIR)
+const auditLog = new AuditLog(CONVERT_DIR)
+const convertService = new ConvertService(taskStore, auditLog, (docId) => getSession(docId))
+const handleConvert = createConvertHandler({ service: convertService, tasks: taskStore, audit: auditLog })
+
 /* ---------------- HTTP：健康检查 + 生产模式静态托管 ---------------- */
 
 const MIME: Record<string, string> = {
@@ -82,8 +95,19 @@ const MIME: Record<string, string> = {
   '.json': 'application/json',
 }
 
-const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
+  try {
+    // 转换中心 API（返回 true 表示已处理）
+    if (await handleConvert(req, res, url)) return
+  } catch (e) {
+    console.error('[convert] 请求处理异常:', e)
+    if (!res.headersSent) {
+      res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({ error: '服务器内部错误', code: 'INTERNAL' }))
+    }
+    return
+  }
   if (url.pathname === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' })
     res.end(JSON.stringify({ ok: true, docs: sessions.size }))
@@ -175,6 +199,7 @@ wss.on('connection', (ws: WebSocket) => {
                 opId: e.opId,
                 clientId: e.clientId,
                 authorName: e.authorName,
+                external: e.external,
               })),
               revision: session.revision,
               seq: session.seq,
@@ -252,6 +277,7 @@ wss.on('connection', (ws: WebSocket) => {
                 opId: e.opId,
                 clientId: e.clientId,
                 authorName: e.authorName,
+                external: e.external,
               })),
               revision: session.revision,
               seq: session.seq,

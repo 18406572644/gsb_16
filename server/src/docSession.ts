@@ -1,6 +1,8 @@
 import {
   apply,
   baseLength,
+  diffToOp,
+  invert,
   isNoop,
   mapPosition,
   transform,
@@ -8,6 +10,7 @@ import {
 } from '../../shared/ot'
 import type { Annotation, LogEntry, Role, UserInfo } from '../../shared/protocol'
 import { canAnnotate, canEdit } from '../../shared/protocol'
+import type { ExternalChangeInfo, RevisionInfo } from '../../shared/convert'
 
 /** 服务端操作日志保留长度：超出后落后太多的客户端只能走全量快照回滚 */
 export const LOG_LIMIT = 1000
@@ -133,13 +136,50 @@ export class DocSession {
       transformed = transform(transformed, this.log[i].op)
     }
 
+    this.acceptOp(transformed, opId, client.clientId, client.name)
+    return null
+  }
+
+  /**
+   * 注入一条外部变更（导入确认 / 回滚等）：服务端依据当前正文直接生成差异操作，
+   * 以与普通编辑相同的协同通道广播给所有在线客户端，全流程纳入版本体系。
+   * 返回 { revision }；目标文本与当前一致时不产生新版本。
+   */
+  commitExternal(
+    authorName: string,
+    targetText: string,
+    external: ExternalChangeInfo,
+  ): { revision: number; opId: string; changed: boolean } {
+    const op = diffToOp(this.doc, targetText)
+    const opId = `ext-${external.kind}-${external.refId}-${this.revision}`
+    if (isNoop(op)) return { revision: this.revision, opId, changed: false }
+    this.acceptOp(op, opId, `external-${external.kind}`, authorName, external)
+    return { revision: this.revision, opId, changed: true }
+  }
+
+  /**
+   * 应用一条已定型（完成变换 / 服务端生成）的操作：记录日志（含逆操作）、
+   * 更新正文与批注锚点、推进版本并广播。ack 与广播共用同一 seq。
+   */
+  private acceptOp(
+    transformed: Op,
+    opId: string,
+    clientId: string,
+    authorName: string,
+    external?: ExternalChangeInfo,
+  ) {
+    const lenBefore = this.doc.length
+    const inverse = invert(transformed, this.doc)
     const entry: LogEntry = {
       revision: this.revision,
       op: transformed,
+      inverse,
       opId,
-      clientId: client.clientId,
-      authorName: client.name,
-      lenBefore: this.doc.length,
+      clientId,
+      authorName,
+      lenBefore,
+      ts: Date.now(),
+      external,
     }
     if (!isNoop(transformed)) {
       this.doc = apply(this.doc, transformed)
@@ -147,30 +187,45 @@ export class DocSession {
     }
     this.log.push(entry)
     if (this.log.length > LOG_LIMIT) this.log.splice(0, this.log.length - LOG_LIMIT)
-    this.acceptedOpIds.add(opId)
-    this.acceptedOpIdQueue.push(opId)
-    if (this.acceptedOpIdQueue.length > LOG_LIMIT * 2) {
-      this.acceptedOpIds.delete(this.acceptedOpIdQueue.shift()!)
-    }
-    this.revision++
-    this.seq++
-
-    // 先确认发起者，再广播给其他人（ack 与广播共用同一 seq，保证序号流一致）
-    client.send({ type: 'ack', opId, revision: this.revision, seq: this.seq })
-    this.broadcast(
-      {
+    if (clientId.startsWith('external-')) {
+      // 外部变更没有发起者连接：广播给全部在线客户端
+      this.revision++
+      this.seq++
+      this.broadcastAll({
         type: 'op',
         revision: entry.revision,
         op: transformed,
         opId,
-        clientId: client.clientId,
-        authorName: client.name,
+        clientId,
+        authorName,
+        external,
         seq: this.seq,
-      },
-      client.clientId,
-    )
+      })
+    } else {
+      const client = this.clients.get(clientId)
+      this.acceptedOpIds.add(opId)
+      this.acceptedOpIdQueue.push(opId)
+      if (this.acceptedOpIdQueue.length > LOG_LIMIT * 2) {
+        this.acceptedOpIds.delete(this.acceptedOpIdQueue.shift()!)
+      }
+      this.revision++
+      this.seq++
+      client?.send({ type: 'ack', opId, revision: this.revision, seq: this.seq })
+      this.broadcast(
+        {
+          type: 'op',
+          revision: entry.revision,
+          op: transformed,
+          opId,
+          clientId,
+          authorName,
+          external,
+          seq: this.seq,
+        },
+        clientId,
+      )
+    }
     this.dirty()
-    return null
   }
 
   /** 编辑操作后，批注锚点随文档做位置映射 */
@@ -291,13 +346,76 @@ export class DocSession {
     return { kind: 'snapshot' }
   }
 
-  /** 序列化快照（持久化用） */
+  /**
+   * 历史版本元信息列表（最近 LOG_LIMIT 个版本步进）。
+   */
+  revisions(): RevisionInfo[] {
+    return this.log.map((e) => ({
+      revision: e.revision + 1,
+      authorName: e.authorName,
+      clientId: e.clientId,
+      opId: e.opId,
+      ts: e.ts ?? 0,
+      lenBefore: e.lenBefore,
+      lenAfter: e.lenBefore + targetLen(e.op),
+      external: e.external,
+    }))
+  }
+
+  /**
+   * 重建指定版本的正文。revision 为目标版本号（== 当前 revision 时直接返回现稿）。
+   * 逆操作逐条回退；日志不足以覆盖时返回 null（调用方提示版本过旧）。
+   */
+  docAtRevision(revision: number): string | null {
+    if (revision === this.revision) return this.doc
+    if (revision < 0 || revision > this.revision) return null
+    const back = this.revision - revision
+    if (back > this.log.length) return null
+    let doc = this.doc
+    for (let i = this.log.length - 1; i >= this.log.length - back; i--) {
+      const e = this.log[i]
+      doc = e.inverse ? apply(doc, e.inverse) : rollbackWithEntry(doc, e)
+    }
+    return doc
+  }
+
+  /** 历史版本的批注：位置经逆操作回映；按创建时间过滤掉当时尚不存在的批注与回复 */
+  annotationsAtRevision(revision: number): Annotation[] {
+    if (revision === this.revision) return [...this.annotations.values()]
+    const back = this.revision - revision
+    if (back > this.log.length) return []
+    const boundary = this.log[this.log.length - back]
+    // 被回退区间中最早的操作时间：此后创建的批注/回复在目标版本尚不存在
+    const cutoffTs = boundary?.ts ?? Number.POSITIVE_INFINITY
+    // 深拷贝：位置回映不得污染实时批注
+    const anns = [...this.annotations.values()]
+      .filter((a) => a.createdAt < cutoffTs)
+      .map((a) => structuredClone(a))
+    for (const a of anns) {
+      a.replies = a.replies.filter((r) => r.createdAt < cutoffTs)
+      a.resolved = false // 解决状态为后验状态，历史快照不还原
+    }
+    for (let i = this.log.length - 1; i >= this.log.length - back; i--) {
+      const inv = this.log[i].inverse
+      if (!inv) continue
+      for (const a of anns) {
+        a.start = mapPosition(a.start, inv, 'before')
+        a.end = mapPosition(a.end, inv, 'after')
+        if (a.end < a.start) a.end = a.start
+        a.orphan = a.start === a.end
+      }
+    }
+    return anns
+  }
+
+  /** 序列化快照（持久化用，含操作日志以支持历史版本重建） */
   serialize() {
     return {
       docId: this.docId,
       doc: this.doc,
       revision: this.revision,
       annotations: [...this.annotations.values()],
+      log: this.log,
     }
   }
 
@@ -306,10 +424,31 @@ export class DocSession {
     doc: string
     revision: number
     annotations: Annotation[]
+    log?: LogEntry[]
   }): DocSession {
     const s = new DocSession(data.docId, data.doc)
     s.revision = data.revision || 0
     for (const a of data.annotations || []) s.annotations.set(a.id, a)
+    if (Array.isArray(data.log)) {
+      for (const e of data.log) {
+        // 旧版本持久化数据可能缺少逆操作：无法重算（需应用前正文），置空时历史重建跳过该步
+        s.log.push(e)
+      }
+    }
     return s
   }
+}
+
+/** 无逆操作缓存时的回退：理论上不发生（新日志均记录 inverse），防御性保留 */
+function rollbackWithEntry(_doc: string, e: LogEntry): string {
+  throw new Error(`历史版本重建缺少逆操作: rev=${e.revision} opId=${e.opId}`)
+}
+
+function targetLen(op: Op): number {
+  let n = 0
+  for (const c of op) {
+    if ('retain' in c) n += c.retain
+    else if ('insert' in c) n += c.insert.length
+  }
+  return n
 }

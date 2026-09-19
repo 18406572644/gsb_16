@@ -1,11 +1,20 @@
 <script setup lang="ts">
+import { onMounted, onUnmounted } from 'vue'
 import { useSessionStore } from '@/stores/session'
+import { useConvertStore } from '@/stores/convert'
 import LoginGate from '@/components/LoginGate.vue'
 import TopBar from '@/components/TopBar.vue'
 import EditorView from '@/components/EditorView.vue'
 import AnnotationPanel from '@/components/AnnotationPanel.vue'
+import ImportDialog from '@/components/ImportDialog.vue'
+import ExportDialog from '@/components/ExportDialog.vue'
+import TaskCenterDrawer from '@/components/TaskCenterDrawer.vue'
 
 const session = useSessionStore()
+const convert = useConvertStore()
+
+onMounted(() => convert.startPolling())
+onUnmounted(() => convert.stopPolling())
 </script>
 
 <template>
@@ -32,5 +41,9 @@ const session = useSessionStore()
       </div>
       <AnnotationPanel />
     </div>
+
+    <ImportDialog />
+    <ExportDialog />
+    <TaskCenterDrawer />
   </div>
 </template>

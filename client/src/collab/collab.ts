@@ -22,6 +22,7 @@ import { WSClient } from '@/ws/wsClient'
 import { OTClient } from '@/ot/otClient'
 import { useSessionStore } from '@/stores/session'
 import { useDocStore } from '@/stores/doc'
+import { useConvertStore } from '@/stores/convert'
 
 type RemoteListener = (op: Op) => void
 
@@ -96,6 +97,7 @@ class Collab {
     this.joinedOnce = false
     useSessionStore().$reset()
     useDocStore().$reset()
+    useConvertStore().reset()
     this.ot.rollback(0)
     this.lastSeq = 0
   }
@@ -184,6 +186,14 @@ class Collab {
         if (!this.checkSeq(msg.seq)) return
         this.ot.remoteChange(msg.op)
         doc.revision = this.ot.revision
+        if (msg.external) {
+          // 外部变更（如他人确认导入）：提示来源，让协作者感知正文为何整体变化
+          if (msg.external.kind === 'import') {
+            ElMessage.info(`📥 ${msg.external.userName} 将「${msg.external.sourceName ?? '导入文档'}」的内容作为协同变更合入了正文`)
+          } else {
+            ElMessage.info(`正文被外部操作更新（${msg.external.kind}）`)
+          }
+        }
         break
       }
 

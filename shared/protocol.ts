@@ -3,6 +3,7 @@
  * 所有消息均为 JSON 文本帧，含 type 字段。
  */
 import type { Op } from './ot'
+import type { ExternalChangeInfo } from './convert'
 
 /** 角色：viewer 只读 / commenter 可批注 / editor 可编辑+批注 */
 export type Role = 'viewer' | 'commenter' | 'editor'
@@ -55,11 +56,17 @@ export interface Annotation {
 export interface LogEntry {
   revision: number
   op: Op
+  /** 逆操作：用于在历史版本导出/回滚时重建任意版本的正文 */
+  inverse?: Op
   opId: string
   clientId: string
   authorName: string
   /** 应用该操作前的文档长度（用于校验客户端操作的基准版本） */
   lenBefore: number
+  /** 服务端接受时间（ms） */
+  ts?: number
+  /** 外部变更标记：导入确认等经由 HTTP 注入的协同变更 */
+  external?: ExternalChangeInfo
 }
 
 /* ---------------- 客户端 → 服务端 ---------------- */
@@ -155,7 +162,14 @@ export interface WelcomeMsg {
 /** 增量补齐：重连后补发错过的操作 */
 export interface OpsMsg {
   type: 'ops'
-  ops: { revision: number; op: Op; opId: string; clientId: string; authorName: string }[]
+  ops: {
+    revision: number
+    op: Op
+    opId: string
+    clientId: string
+    authorName: string
+    external?: ExternalChangeInfo
+  }[]
   revision: number
   seq: number
 }
@@ -176,6 +190,8 @@ export interface RemoteOpMsg {
   opId: string
   clientId: string
   authorName: string
+  /** 外部变更（导入确认等），客户端据此提示变更来源 */
+  external?: ExternalChangeInfo
   seq: number
 }
 
